@@ -1,0 +1,13 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/RsyncWindows.Cli/RsyncWindows.Cli.csproj" />
+    <Project Path="src/RsyncWindows.Core/RsyncWindows.Core.csproj" />
+    <Project Path="src/RsyncWindows.Service/RsyncWindows.Service.csproj" />
+    <Project Path="src/RsyncWindows.Transports/RsyncWindows.Transports.csproj" />
+    <Project Path="src/RsyncWindows.Tray/RsyncWindows.Tray.csproj" />
+  </Folder>
+  <Folder Name="/test/">
+    <Project Path="test/RsyncWindows.Core.Tests/RsyncWindows.Core.Tests.csproj" />
+    <Project Path="test/RsyncWindows.Interop.Tests/RsyncWindows.Interop.Tests.csproj" />
+  </Folder>
+</Solution>
