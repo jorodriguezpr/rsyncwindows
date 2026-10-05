@@ -25,6 +25,10 @@ other rsyncWindows installs — no separate agent or SFTP bridge required.
   (though keys are still recommended for unattended/scripted transfers)
 - **Real-time progress**: `-v` prints each file's path as its transfer begins, not just a
   one-line summary at the end
+- **One bad file doesn't stop the sync**: a file that is locked, read-protected or can't be
+  written ("Access denied") is reported and skipped, everything else is transferred, and the run
+  ends with exit code 23 ("partial transfer"), the same as real rsync. Files another program has
+  open are still read, and read-only destination files are updated
 - Owner/group and permission fields on the wire, timestamp preservation, symlink recreation,
   filename-pattern excludes/includes, dry-run preview (`-n`), and more — see
   [Command-line options](#command-line-options) below

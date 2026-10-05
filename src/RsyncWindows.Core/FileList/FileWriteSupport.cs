@@ -57,19 +57,50 @@ public static class FileWriteSupport
     /// <summary>Creates the file's parent directory (if any) and writes its content -- both
     /// steps can fail for the same "illegal on NTFS" reasons, so both are covered by the one
     /// try/catch.</summary>
-    public static bool TryWriteFile(string path, byte[] data, out string? error)
+    public static bool TryWriteFile(string path, byte[] data, out string? error) =>
+        TryReplace(path, () => File.WriteAllBytes(path, data), out error);
+
+    /// <summary>Local-to-local counterpart of <see cref="TryWriteFile"/>: copies
+    /// <paramref name="source"/> over <paramref name="target"/> with the same skip-and-report
+    /// behavior (a locked or unreadable source, or a target that can't be replaced, skips this one
+    /// file instead of aborting the run).</summary>
+    public static bool TryCopyFile(string source, string target, out string? error) =>
+        TryReplace(target, () => File.Copy(source, target, overwrite: true), out error);
+
+    /// <summary>Creates the parent directory, then replaces <paramref name="path"/>. An existing
+    /// target with the read-only attribute is made writable first: real rsync replaces a file
+    /// whatever its own permission bits are (it writes a temp file and renames it over the old one,
+    /// which only needs write access to the directory), and <c>-p</c> re-applies read-only
+    /// afterwards when the source is read-only. Without this, a file that an earlier <c>-p</c> run
+    /// made read-only could never be updated again -- every later run skipped it with
+    /// "Access to the path is denied". If the write still fails, the attribute is restored.</summary>
+    private static bool TryReplace(string path, Action write, out string? error)
     {
+        FileAttributes? clearedReadOnly = null;
         try
         {
             string? dir = Path.GetDirectoryName(path);
             if (!string.IsNullOrEmpty(dir))
                 Directory.CreateDirectory(dir);
-            File.WriteAllBytes(path, data);
+            if (File.Exists(path))
+            {
+                var attrs = File.GetAttributes(path);
+                if (attrs.HasFlag(FileAttributes.ReadOnly))
+                {
+                    File.SetAttributes(path, attrs & ~FileAttributes.ReadOnly);
+                    clearedReadOnly = attrs;
+                }
+            }
+            write();
             error = null;
             return true;
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException or PathTooLongException)
         {
+            if (clearedReadOnly is { } original)
+            {
+                try { File.SetAttributes(path, original); } catch { /* best effort: leave it as we found it */ }
+            }
             error = ex.Message;
             return false;
         }

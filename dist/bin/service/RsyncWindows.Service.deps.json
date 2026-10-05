@@ -7,7 +7,7 @@
   "targets": {
     ".NETCoreApp,Version=v10.0": {},
     ".NETCoreApp,Version=v10.0/win-x64": {
-      "RsyncWindows.Service/2.0.0": {
+      "RsyncWindows.Service/2.0.1": {
         "dependencies": {
           "Microsoft.Extensions.Hosting": "10.0.11",
           "Microsoft.Extensions.Hosting.WindowsServices": "10.0.11",
@@ -1176,7 +1176,7 @@
     }
   },
   "libraries": {
-    "RsyncWindows.Service/2.0.0": {
+    "RsyncWindows.Service/2.0.1": {
       "type": "project",
       "serviceable": false,
       "sha512": ""

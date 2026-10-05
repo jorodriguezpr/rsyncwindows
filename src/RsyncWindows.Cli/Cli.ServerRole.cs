@@ -57,7 +57,24 @@ internal static class ServerRole
             var encoder = new FileListEncoder();
             // The remote path is the transfer root; walk it and send the flist + files.
             string root = args[^1];
-            var entries = FileListBuilder.Walk(root).ToList();
+            // Read every regular file BEFORE the flist goes out: the peer requests files by flist
+            // index, so a file we can't read (locked, access denied) must be left out of the list
+            // up front -- reading it afterwards and throwing aborted the whole transfer.
+            var entries = new List<FileEntry>();
+            var contents = new Dictionary<string, byte[]>(StringComparer.Ordinal);
+            foreach (var entry in FileListBuilder.Walk(root))
+            {
+                if (entry.FileType == RsyncFileType.Regular)
+                {
+                    if (!RsyncWindows.Core.FileList.FileReadSupport.TryReadFile(Resolve(root, entry.Path), out byte[] content, out string? readError))
+                    {
+                        Console.Error.WriteLine($"rsyncWindows: skipped '{entry.Path}' (cannot read source): {readError}");
+                        continue;
+                    }
+                    contents[entry.Path] = content;
+                }
+                entries.Add(entry);
+            }
             foreach (var entry in entries)
                 encoder.Write(session.Output, entry, preserveUid, preserveGid);
             encoder.WriteEndOfList(session.Output);
@@ -68,7 +85,7 @@ internal static class ServerRole
             // matching comment: the peer's generator requests transfers by position in the full
             // flist we sent, so filtering out non-regular entries here desyncs every later index.
             var files = entries
-                .Select(e => new SenderSession.FileToSend(e, e.FileType == RsyncFileType.Regular ? File.ReadAllBytes(Resolve(root, e.Path)) : []))
+                .Select(e => new SenderSession.FileToSend(e, e.FileType == RsyncFileType.Regular ? contents[e.Path] : []))
                 .ToList();
             SenderSession.RunSenderLoop(session.Input, session.Output, files, session.ChecksumSeed, compress: session.CompressionEnabled);
             session.Output.Flush();
@@ -128,10 +145,14 @@ internal static class ServerRole
         }
     }
 
+    /// <summary>The existing file as the delta basis; one that can't be read becomes an empty
+    /// basis (whole-file transfer, as real rsync does) instead of aborting the transfer.</summary>
     private static byte[] ReadBasis(string root, string path)
     {
-        string full = Resolve(root, path);
-        return File.Exists(full) ? File.ReadAllBytes(full) : [];
+        byte[] basis = RsyncWindows.Core.FileList.FileReadSupport.ReadBasisOrEmpty(Resolve(root, path), out string? error);
+        if (error != null)
+            Console.Error.WriteLine($"rsyncWindows: cannot read existing '{path}' ({error}); transferring it whole");
+        return basis;
     }
 
     private static string Resolve(string root, string wirePath)

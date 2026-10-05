@@ -32,6 +32,24 @@ internal sealed class ClientRunner(RsyncOptions options)
 {
     private readonly FilterEngine _filters = BuildFilters(options);
 
+    // Files/entries skipped because of a per-file error (access denied, locked, illegal name...).
+    // Like real rsync, the run continues and finishes with exit code 23 ("partial transfer due
+    // to error") instead of aborting everything over one file.
+    private int _skipped;
+
+    private void Skip(string what, string? error)
+    {
+        _skipped++;
+        Console.Error.WriteLine($"rsyncWindows: skipped {what}: {error}");
+    }
+
+    private int ExitCode()
+    {
+        if (_skipped > 0)
+            Console.Error.WriteLine($"rsyncWindows: {_skipped} item(s) skipped because of errors (see above); everything else was transferred");
+        return _skipped > 0 ? 23 : 0;
+    }
+
     public int Run()
     {
         var destSpec = RemoteSpec.Parse(options.Destination);
@@ -82,7 +100,8 @@ internal sealed class ClientRunner(RsyncOptions options)
             string target = ResolveLocal(destPath, item.WirePath);
             if (item.Entry.FileType == RsyncFileType.Directory)
             {
-                Directory.CreateDirectory(target);
+                if (!FileWriteSupport.TryCreateDirectory(target, out string? dirError))
+                    Skip($"directory '{item.WirePath}'", dirError);
                 continue;
             }
             if (item.Entry.FileType == RsyncFileType.Symlink)
@@ -91,21 +110,24 @@ internal sealed class ClientRunner(RsyncOptions options)
                 {
                     Directory.CreateDirectory(Path.GetDirectoryName(target)!);
                     if (!Core.FileList.SymlinkSupport.TryCreateSymlink(target, item.Entry.SymlinkTarget, out string? error))
-                        Console.Error.WriteLine($"rsyncWindows: skipped symlink '{item.WirePath}': {error}");
+                        Skip($"symlink '{item.WirePath}'", error);
                 }
                 continue;
             }
             if (item.Entry.FileType != RsyncFileType.Regular)
                 continue;
 
-            Directory.CreateDirectory(Path.GetDirectoryName(target)!);
-            File.Copy(item.LocalPath, target, overwrite: true);
+            if (!FileWriteSupport.TryCopyFile(item.LocalPath, target, out string? copyError))
+            {
+                Skip($"'{item.WirePath}'", copyError);
+                continue;
+            }
             TrySetTimes(target, item.Entry);
             TrySetPermissions(target, item.Entry);
             transferred++;
         }
         Report($"sent {transferred} file(s)");
-        return 0;
+        return ExitCode();
     }
 
     // ------------------------------------------------------------- push (SSH / daemon)
@@ -147,7 +169,7 @@ internal sealed class ClientRunner(RsyncOptions options)
         var raw = transport.Connect();
         var session = ProtocolNegotiator.Negotiate(raw, isServer: false, compress: options.Compress);
         PushSources(session);
-        return 0;
+        return ExitCode();
     }
 
     private int RunDaemonPush(RemoteSpec.Daemon dest)
@@ -167,7 +189,7 @@ internal sealed class ClientRunner(RsyncOptions options)
         // doc comment for how this surfaced: "protocol version mismatch -- remote sent <garbage>").
         var session = ProtocolNegotiator.Negotiate(raw, isServer: false, preNegotiatedVersion: remoteVersion, compress: options.Compress);
         PushSources(session);
-        return 0;
+        return ExitCode();
     }
 
     // ------------------------------------------------------------- pull (SSH / daemon)
@@ -188,7 +210,7 @@ internal sealed class ClientRunner(RsyncOptions options)
         var raw = transport.Connect();
         var session = ProtocolNegotiator.Negotiate(raw, isServer: false, compress: options.Compress);
         PullInto(session);
-        return 0;
+        return ExitCode();
     }
 
     private int RunDaemonPull(RemoteSpec.Daemon src)
@@ -204,7 +226,7 @@ internal sealed class ClientRunner(RsyncOptions options)
 
         var session = ProtocolNegotiator.Negotiate(raw, isServer: false, preNegotiatedVersion: remoteVersion, compress: options.Compress);
         PullInto(session);
-        return 0;
+        return ExitCode();
     }
 
     /// <summary>Resolves the username/password <see cref="DaemonHandshake.RunClientSide"/> should
@@ -243,9 +265,18 @@ internal sealed class ClientRunner(RsyncOptions options)
         {
             if (!entries.Any(e => e.Path == source.WirePath))
             {
-                entries.Add(source.Entry);
                 if (source.Entry.FileType == RsyncFileType.Regular)
-                    data[source.WirePath] = File.ReadAllBytes(source.LocalPath);
+                {
+                    // Read BEFORE the entry joins the flist: the peer requests files by flist
+                    // index, so an unreadable file must never be announced in the first place.
+                    if (!FileReadSupport.TryReadFile(source.LocalPath, out byte[] content, out string? readError))
+                    {
+                        Skip($"'{source.WirePath}' (cannot read source)", readError);
+                        continue;
+                    }
+                    data[source.WirePath] = content;
+                }
+                entries.Add(source.Entry);
             }
         }
 
@@ -312,7 +343,7 @@ internal sealed class ClientRunner(RsyncOptions options)
             string target = ResolveLocal(destRoot, file.Entry.Path);
             if (!FileWriteSupport.TryWriteFile(target, file.Data, out string? writeError))
             {
-                Console.Error.WriteLine($"rsyncWindows: skipped '{file.Entry.Path}': {writeError}");
+                Skip($"'{file.Entry.Path}'", writeError);
                 continue;
             }
             TrySetTimes(target, file.Entry);
@@ -329,24 +360,24 @@ internal sealed class ClientRunner(RsyncOptions options)
     /// for directories, when the peer's name is legal on ITS filesystem but not NTFS (e.g. a
     /// colon) -- see <see cref="FileWriteSupport"/>'s doc comment for why this matters: one bad
     /// name used to kill the entire connection, losing every other file in the same transfer.</summary>
-    private static void ApplyNonTransferEntry(string destRoot, FileEntry entry)
+    private void ApplyNonTransferEntry(string destRoot, FileEntry entry)
     {
         string full = ResolveLocal(destRoot, entry.Path);
         if (entry.FileType == RsyncFileType.Directory)
         {
             if (!FileWriteSupport.TryCreateDirectory(full, out string? error))
-                Console.Error.WriteLine($"rsyncWindows: skipped directory '{entry.Path}': {error}");
+                Skip($"directory '{entry.Path}'", error);
         }
         else if (entry.FileType == RsyncFileType.Symlink && entry.SymlinkTarget != null)
         {
             string? dir = Path.GetDirectoryName(full);
             if (!string.IsNullOrEmpty(dir) && !FileWriteSupport.TryCreateDirectory(dir, out string? dirError))
             {
-                Console.Error.WriteLine($"rsyncWindows: skipped symlink '{entry.Path}': {dirError}");
+                Skip($"symlink '{entry.Path}'", dirError);
                 return;
             }
             if (!Core.FileList.SymlinkSupport.TryCreateSymlink(full, entry.SymlinkTarget, out string? error))
-                Console.Error.WriteLine($"rsyncWindows: skipped symlink '{entry.Path}': {error}");
+                Skip($"symlink '{entry.Path}'", error);
         }
     }
 
@@ -425,10 +456,17 @@ internal sealed class ClientRunner(RsyncOptions options)
         return engine;
     }
 
+    /// <summary>The existing destination file as the delta basis. One that can't be read (access
+    /// denied, locked) becomes an empty basis -- the sender transfers the whole file, as real rsync
+    /// does -- instead of an exception that aborts the whole pull. The write that follows may still
+    /// fail for the same reason; that one is skipped and reported per file.</summary>
     private static byte[] ReadLocalBasis(string destRoot, string wirePath)
     {
         string full = ResolveLocal(destRoot, wirePath);
-        return File.Exists(full) ? File.ReadAllBytes(full) : [];
+        byte[] basis = FileReadSupport.ReadBasisOrEmpty(full, out string? error);
+        if (error != null)
+            Console.Error.WriteLine($"rsyncWindows: cannot read existing '{wirePath}' ({error}); transferring it whole");
+        return basis;
     }
 
     private void TrySetTimes(string target, FileEntry entry)

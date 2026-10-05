@@ -31,7 +31,7 @@ namespace RsyncWindows.Core;
 public static class AppInfo
 {
     public const string ProductName = "rsyncWindows";
-    public const string Version = "2.0.0";
+    public const string Version = "2.0.1";
     public const string Author = "Jose Rodriguez Arroyo";
     public const string Email = "jrpcone@gmail.com";
     public const string GitHub = "https://github.com/jorodriguezpr";

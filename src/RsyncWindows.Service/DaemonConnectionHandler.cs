@@ -93,7 +93,24 @@ public sealed class DaemonConnectionHandler(RsyncdConfig config, Action<string> 
         // ndx=0 request was queued right behind this terminator and never got read at all.
         RecvFilterList(session.Input);
 
-        var entries = FileListBuilder.Walk(module.Path).ToList();
+        // Read every regular file BEFORE the flist goes out: the client requests files by flist
+        // index, so one we can't read (locked, access denied) is left out of the list up front
+        // instead of throwing mid-transfer and dropping the whole connection.
+        var entries = new List<FileEntry>();
+        var contents = new Dictionary<string, byte[]>(StringComparer.Ordinal);
+        foreach (var entry in FileListBuilder.Walk(module.Path))
+        {
+            if (entry.FileType == RsyncFileType.Regular)
+            {
+                if (!FileReadSupport.TryReadFile(ResolvePath(module.Path, entry.Path), out byte[] content, out string? readError))
+                {
+                    log($"skipped '{entry.Path}' for {clientAddress} (cannot read source): {readError}");
+                    continue;
+                }
+                contents[entry.Path] = content;
+            }
+            entries.Add(entry);
+        }
 
         // The file-list field set depends on the SESSION's preserve options, which come from
         // the client's own --server argv (both sides parse the same bundled flags; see
@@ -112,7 +129,7 @@ public sealed class DaemonConnectionHandler(RsyncdConfig config, Action<string> 
         session.Output.Flush();
 
         var files = entries
-            .Select(e => new SenderSession.FileToSend(e, ReadContent(module.Path, e)))
+            .Select(e => new SenderSession.FileToSend(e, e.FileType == RsyncFileType.Regular ? contents[e.Path] : []))
             .ToList();
 
         SenderSession.RunSenderLoop(session.Input, session.Output, files, session.ChecksumSeed, writeDaemonStats: true, compress: session.CompressionEnabled);
@@ -132,7 +149,7 @@ public sealed class DaemonConnectionHandler(RsyncdConfig config, Action<string> 
         bool preserveTimes = request.ServerArgs.Any(a => HasShortFlag(a, 't'));
         bool preservePerms = request.ServerArgs.Any(a => HasShortFlag(a, 'p'));
 
-        var received = ReceiverSession.RunReceiverLoop(session.Input, session.Output, path => ReadBasis(module.Path, path), session.ChecksumSeed,
+        var received = ReceiverSession.RunReceiverLoop(session.Input, session.Output, path => ReadBasis(module.Path, path, clientAddress), session.ChecksumSeed,
             compress: session.CompressionEnabled, preserveUid: preserveUid, preserveGid: preserveGid,
             id0Names: session.CompatFlags.HasFlag(CompatFlags.Id0Names),
             onNonTransferEntry: e => ApplyNonTransferEntry(module.Path, e, clientAddress));
@@ -188,13 +205,15 @@ public sealed class DaemonConnectionHandler(RsyncdConfig config, Action<string> 
         }
     }
 
-    private static byte[] ReadContent(string moduleRoot, FileEntry entry) =>
-        entry.FileType == RsyncFileType.Regular ? File.ReadAllBytes(ResolvePath(moduleRoot, entry.Path)) : [];
-
-    private static byte[] ReadBasis(string moduleRoot, string relativePath)
+    /// <summary>The existing file as the delta basis; one that can't be read (access denied,
+    /// locked) becomes an empty basis -- whole-file transfer, as real rsync does -- instead of an
+    /// exception that drops the client's connection.</summary>
+    private byte[] ReadBasis(string moduleRoot, string relativePath, IPAddress clientAddress)
     {
-        string full = ResolvePath(moduleRoot, relativePath);
-        return File.Exists(full) ? File.ReadAllBytes(full) : [];
+        byte[] basis = FileReadSupport.ReadBasisOrEmpty(ResolvePath(moduleRoot, relativePath), out string? error);
+        if (error != null)
+            log($"cannot read existing '{relativePath}' for {clientAddress} ({error}); transferring it whole");
+        return basis;
     }
 
     // \\?\-prefixed so every downstream File/Directory call bypasses MAX_PATH -- see
